@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>주차 층</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 24px 16px; text-align: center; background: #111; color: #eee; }
+  button { font-size: 20px; padding: 14px 28px; border: 0; border-radius: 12px; background: #3b82f6; color: #fff; }
+  #status { margin-top: 12px; color: #aaa; }
+  #floor { font-size: 96px; font-weight: 700; margin: 24px 0; }
+  #saved { font-size: 18px; line-height: 1.7; }
+  a { color: #93c5fd; }
+</style>
+</head>
+<body>
+<h1>주차 층</h1>
+<button id="connect">기기 연결</button>
+<div id="status">연결 안 됨</div>
+<div id="floor">-</div>
+<div id="saved"></div>
+
+<script>
+// Must match parking_ble.ino
+const SERVICE = '6e1f0001-5a3c-4b7e-9d2a-1c0f7a3b8e01';
+const FLOOR_CHAR = '6e1f0002-5a3c-4b7e-9d2a-1c0f7a3b8e01';
+const $ = id => document.getElementById(id);
+let coords = null;
+
+if (navigator.geolocation) {
+  navigator.geolocation.watchPosition(p => { coords = p.coords; }, () => {}, { enableHighAccuracy: true });
+}
+
+// Saved on every update, so the last value before the car is turned off stays.
+function save(label) {
+  const rec = { label, time: Date.now(), lat: coords?.latitude, lon: coords?.longitude };
+  try { localStorage.setItem('parked', JSON.stringify(rec)); } catch {}
+  render();
+}
+
+function render() {
+  let rec = null;
+  try { rec = JSON.parse(localStorage.getItem('parked')); } catch {}
+  const box = $('saved');
+  box.replaceChildren();
+  if (!rec) { box.textContent = '저장된 주차 기록 없음'; return; }
+  const title = document.createElement('div');
+  title.textContent = `마지막 주차: ${rec.label}`;
+  const time = document.createElement('div');
+  time.textContent = new Date(rec.time).toLocaleString('ko-KR');
+  box.append(title, time);
+  if (rec.lat != null) {
+    const a = document.createElement('a');
+    a.href = `https://maps.google.com/?q=${rec.lat},${rec.lon}`;
+    a.textContent = '지도에서 보기';
+    box.append(a);
+  }
+}
+
+async function connect(device) {
+  const server = await device.gatt.connect();
+  const service = await server.getPrimaryService(SERVICE);
+  const ch = await service.getCharacteristic(FLOOR_CHAR);
+  ch.addEventListener('characteristicvaluechanged', e => {
+    const label = new TextDecoder().decode(e.target.value);
+    $('floor').textContent = label;
+    save(label);
+  });
+  await ch.startNotifications();
+  $('status').textContent = '연결됨: ' + device.name;
+}
+
+// Car started again -> device powers on -> reconnect while this page is open.
+function retry(device) {
+  setTimeout(() => connect(device).catch(() => retry(device)), 10000);
+}
+
+$('connect').onclick = async () => {
+  if (!navigator.bluetooth) {
+    $('status').textContent = '이 브라우저는 블루투스 연결을 지원하지 않아요. 안드로이드는 Chrome, 아이폰은 Bluefy 앱을 쓰세요.';
+    return;
+  }
+  try {
+    const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+    device.addEventListener('gattserverdisconnected', () => {
+      $('status').textContent = '연결 끊김 (시동 꺼짐) — 마지막 층 저장됨';
+      retry(device);
+    });
+    await connect(device);
+  } catch (e) {
+    $('status').textContent = '오류: ' + e.message;
+  }
+};
+
+render();
+</script>
+</body>
+</html>
