@@ -1,0 +1,30 @@
+# Builds parking_ble.ino on GitHub's servers (the local PC blocks the compiler).
+# Runs on every upload of parking_ble.ino; the firmware appears under Actions -> latest run -> Artifacts.
+name: build-firmware
+on:
+  push:
+    paths: ['parking_ble.ino', '.github/workflows/build.yml']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install ESP32 board package and libraries (same versions as the local PC)
+        run: |
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls $URL
+          arduino-cli core install esp32:esp32@4.0.0 --additional-urls $URL
+          arduino-cli lib install "Adafruit BMP280 Library@3.0.0" "Adafruit SSD1306@2.5.17" "Adafruit GFX Library@1.13.0" "Adafruit BusIO@1.17.4" "Adafruit Unified Sensor@1.1.15"
+      - name: Compile
+        run: |
+          mkdir -p sketch/parking_ble
+          cp parking_ble.ino sketch/parking_ble/
+          arduino-cli compile --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc --output-dir out sketch/parking_ble
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/*.bin   # app-only parking_ble.ino.bin is flashed at 0x10000 (keeps the saved floor)
