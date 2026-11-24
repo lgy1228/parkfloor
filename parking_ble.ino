@@ -54,6 +54,19 @@ long offsetUntilMs = -1;    // -1 = keep until the first ramp after power-on end
 bool wasMoving = false;
 int storedFloor = 0, steadyFloor = 0, steadySecs = 0;
 
+// Trip log, kept in flash so it survives the power cut at parking: one record per ramp segment
+// (raw height change, how much of it was counted as floors, seconds since the last road signal),
+// plus power-on and floor-saved records. Read it over USB: send 'L' on the serial port (also printed at boot).
+struct LogRec { uint32_t t; uint16_t dur; int16_t rawCm; int16_t cntCm; uint16_t sinceRoad; uint8_t flags; };
+enum : uint8_t { LF_GPS = 1, LF_SKIP = 2, LF_STORE = 64, LF_BOOT = 128 };
+const int LOG_N = 32;
+LogRec logBuf[LOG_N];
+uint8_t logHead = 0, logCount = 0;          // ring buffer: next write slot, number of valid records
+float rawSum = 0;                           // every height change since power-on (not filtered)
+unsigned long lastRoadMs = 0, epStartMs = 0;
+bool roadEver = false, epSkipped = false;
+float epRawStart = 0, epCntStart = 0;
+
 void setupBle() {
   if (!BLE.begin("ParkFloor")) {
     Serial.println("BLE init failed, running without Bluetooth.");
@@ -75,6 +88,29 @@ void setupBle() {
   BLEAdvertising adv = BLE.getAdvertising();
   adv.addServiceUUID(SERVICE_UUID);
   adv.start();
+}
+
+void addLog(uint16_t dur, float rawM, float cntM, uint8_t flags) {
+  uint16_t since = roadEver ? (uint16_t)min((millis() - lastRoadMs) / 1000UL, 65534UL) : 65535;
+  logBuf[logHead] = { (uint32_t)(millis() / 1000), dur, (int16_t)lroundf(rawM * 100), (int16_t)lroundf(cntM * 100), since, flags };
+  logHead = (logHead + 1) % LOG_N;
+  if (logCount < LOG_N) logCount++;
+  prefs.putBytes("log", logBuf, sizeof(logBuf));
+  prefs.putUChar("logHead", logHead);
+  prefs.putUChar("logCount", logCount);
+}
+
+void printLog() {
+  Serial.printf("---- trip log (%d records, oldest first) ----\n", logCount);
+  for (int k = 0; k < logCount; k++) {
+    const LogRec& r = logBuf[(logHead - logCount + k + LOG_N) % LOG_N];
+    String road = r.sinceRoad == 65535 ? String("no road signal yet") : String(r.sinceRoad) + "s after road signal";
+    if (r.flags & LF_BOOT)       Serial.printf("POWER ON   saved floor %s\n", floorLabel(r.rawCm).c_str());
+    else if (r.flags & LF_STORE) Serial.printf("  t=%5lus  SAVED %s at %+.2fm (%s)\n", (unsigned long)r.t, floorLabel(r.rawCm).c_str(), r.cntCm / 100.0, road.c_str());
+    else Serial.printf("  t=%5lus  ramp %3us  raw %+.2fm  counted %+.2fm  %s%s%s\n", (unsigned long)r.t, r.dur,
+                       r.rawCm / 100.0, r.cntCm / 100.0, road.c_str(), (r.flags & LF_GPS) ? " [GPS]" : "", (r.flags & LF_SKIP) ? " [skipped]" : "");
+  }
+  Serial.println("---- end of log ----");
 }
 
 void publish(const String& label) {
@@ -160,6 +196,13 @@ void setup() {
   prefs.begin("park", false);
   storedFloor = steadyFloor = offsetFloor = prefs.getChar("floor", 0);
   Serial.printf("Starting from saved floor %s\n", floorLabel(offsetFloor).c_str());
+  if (prefs.getBytesLength("log") == sizeof(logBuf)) {
+    prefs.getBytes("log", logBuf, sizeof(logBuf));
+    logHead = prefs.getUChar("logHead", 0) % LOG_N;
+    logCount = min((int)prefs.getUChar("logCount", 0), LOG_N);
+  }
+  addLog(0, offsetFloor, 0, LF_BOOT);       // power-on marker (rawCm holds the saved floor number)
+  printLog();
 
   setupBle();
   prevP = readMedianHpa();
@@ -167,8 +210,26 @@ void setup() {
 
 void loop() {
   float p = readMedianHpa();        // takes ~1 s, sets the loop rate
-  float h = stepTracker(heightDiff(p, prevP));
+  float dh = heightDiff(p, prevP);
+  float hRoadBefore = hSinceRoad;
+  float h = stepTracker(dh);
   prevP = p;
+  rawSum += dh;
+  if (Serial.available() && Serial.read() == 'L') printLog();
+
+  // ramp segment start/end, for the trip log
+  if (moving && !wasMoving) {
+    float win = 0;                  // the segment really started up to MOVE_WINDOW_S ago (stepTracker backfills it)
+    for (int k = 1; k <= MOVE_WINDOW_S; k++) win += rawDh[(idx - k + LOOKBACK_S) % LOOKBACK_S];
+    epStartMs = millis() - MOVE_WINDOW_S * 1000UL;
+    epRawStart = rawSum - win;
+    epCntStart = hRoadBefore;
+    epSkipped = false;
+  }
+  if (moving) epSkipped |= skipEpisode;
+  if (!moving && wasMoving)
+    addLog((millis() - epStartMs) / 1000, rawSum - epRawStart, hSinceRoad - epCntStart,
+           (gpsSeen ? LF_GPS : 0) | (epSkipped ? LF_SKIP : 0));
 
   if (wasMoving && !moving && offsetUntilMs < 0) {
     // First ramp after power-on is over (e.g. drove up out of the home garage):
@@ -186,6 +247,9 @@ void loop() {
     gpsSeen = true;
     hSinceRoad = 0;
     skipEpisode = moving;
+    roadEver = true;
+    lastRoadMs = millis();
+    if (moving) epCntStart = 0;     // counting restarts mid-segment
   }
   // With GPS: count ramps since the last fast driving. Without: 3-minute lookback + saved floor.
   int floorNum = gpsSeen ? (int)round(hSinceRoad / FLOOR_HEIGHT_M)
@@ -197,6 +261,7 @@ void loop() {
   if (steadySecs >= STORE_AFTER_S && floorNum != storedFloor) {
     prefs.putChar("floor", floorNum);
     storedFloor = floorNum;
+    addLog(0, floorNum, usedH, LF_STORE | (gpsSeen ? LF_GPS : 0));  // rawCm holds the floor number
   }
 
   String label = floorLabel(floorNum);
