@@ -17,7 +17,12 @@
 const int SDA_PIN = 8;              // ESP32-C3 SuperMini I2C
 const int SCL_PIN = 9;
 const float FLOOR_HEIGHT_M = 3.0;   // tune per parking lot (usually 2.8-3.5 m)
-const float MOVE_M = 0.4;           // height change within the window that counts as a ramp
+const float MOVE_M = 1.2;           // height change within the window that counts as a ramp (0.12 m/s).
+                                    // Trip log 11-24: garage ramp ~0.2 m/s, gentle approach road ~0.07 m/s, noise <0.06 m/s
+// With GPS, floors = number of steep ramp segments since the last fast driving (not meters / 3 m):
+// the home garage entrance ramp alone is ~4.8 m deep for one floor. A segment counts as 1 floor,
+// more only for long continuous (spiral) ramps: floor(|dh| / 3.3 + 0.35), i.e. 2 floors from ~5.4 m.
+const float MIN_SEG_M = 1.5, SEG_FLOOR_M = 3.3, SEG_BIAS = 0.35;
 const int MOVE_WINDOW_S = 10;
 const int LOOKBACK_S = 180;         // shortcut: fixed 3 min window, idling longer than this resets to 1F; upgrade with GPS speed from the phone
 
@@ -38,6 +43,13 @@ volatile bool roadSignal = false;
 bool gpsSeen = false;       // shortcut: once set, stays for this power-on; hills after the phone page closes are not reset
 float hSinceRoad = 0;       // ramp height since the last road signal
 bool skipEpisode = false;   // climb that was under way at the road signal is road, not a ramp: skip it until it ends
+int floorsSinceRoad = 0;    // finished ramp segments since the last road signal, as floors
+
+int segFloors(float dh) {
+  if (fabs(dh) < MIN_SEG_M) return 0;
+  int n = max(1, (int)floor(fabs(dh) / SEG_FLOOR_M + SEG_BIAS));
+  return dh > 0 ? n : -n;
+}
 
 float rawDh[LOOKBACK_S];   // height change each second
 float accDh[LOOKBACK_S];   // same, but 0 while still
@@ -105,8 +117,8 @@ void printLog() {
   for (int k = 0; k < logCount; k++) {
     const LogRec& r = logBuf[(logHead - logCount + k + LOG_N) % LOG_N];
     String road = r.sinceRoad == 65535 ? String("no road signal yet") : String(r.sinceRoad) + "s after road signal";
-    if (r.flags & LF_BOOT)       Serial.printf("POWER ON   saved floor %s\n", floorLabel(r.rawCm).c_str());
-    else if (r.flags & LF_STORE) Serial.printf("  t=%5lus  SAVED %s at %+.2fm (%s)\n", (unsigned long)r.t, floorLabel(r.rawCm).c_str(), r.cntCm / 100.0, road.c_str());
+    if (r.flags & LF_BOOT)       Serial.printf("POWER ON   saved floor %s\n", floorLabel(r.rawCm / 100).c_str());
+    else if (r.flags & LF_STORE) Serial.printf("  t=%5lus  SAVED %s at %+.2fm (%s)\n", (unsigned long)r.t, floorLabel(r.rawCm / 100).c_str(), r.cntCm / 100.0, road.c_str());
     else Serial.printf("  t=%5lus  ramp %3us  raw %+.2fm  counted %+.2fm  %s%s%s\n", (unsigned long)r.t, r.dur,
                        r.rawCm / 100.0, r.cntCm / 100.0, road.c_str(), (r.flags & LF_GPS) ? " [GPS]" : "", (r.flags & LF_SKIP) ? " [skipped]" : "");
   }
@@ -227,6 +239,7 @@ void loop() {
     epSkipped = false;
   }
   if (moving) epSkipped |= skipEpisode;
+  if (!moving && wasMoving) floorsSinceRoad += segFloors(hSinceRoad - epCntStart);
   if (!moving && wasMoving)
     addLog((millis() - epStartMs) / 1000, rawSum - epRawStart, hSinceRoad - epCntStart,
            (gpsSeen ? LF_GPS : 0) | (epSkipped ? LF_SKIP : 0));
@@ -249,10 +262,11 @@ void loop() {
     skipEpisode = moving;
     roadEver = true;
     lastRoadMs = millis();
+    floorsSinceRoad = 0;
     if (moving) epCntStart = 0;     // counting restarts mid-segment
   }
   // With GPS: count ramps since the last fast driving. Without: 3-minute lookback + saved floor.
-  int floorNum = gpsSeen ? (int)round(hSinceRoad / FLOOR_HEIGHT_M)
+  int floorNum = gpsSeen ? floorsSinceRoad + (moving ? segFloors(hSinceRoad - epCntStart) : 0)
                          : (int)round(h / FLOOR_HEIGHT_M) + offsetFloor;
   // height the floor is computed from, shown on screen so the floor height can be calibrated
   float usedH = gpsSeen ? hSinceRoad : h + offsetFloor * FLOOR_HEIGHT_M;
